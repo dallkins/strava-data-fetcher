@@ -369,21 +369,32 @@ class DatabaseManager:
                 cursor.execute('''
                     INSERT OR REPLACE INTO strava_activities 
                     (id, athlete_name, name, start_date_local, start_date, utc_offset,
-                     gear_id, gear_name, distance, elapsed_time, moving_time, calories,
-                     average_heartrate, max_heartrate, average_watts, max_watts,
-                     average_speed, max_speed, type, sport_type, total_elevation_gain,
-                     kudos_count, weighted_average_watts, average_cadence, trainer,
-                     map_polyline, device_name, timezone, start_latlng, end_latlng,
-                     updated_at)
+                    gear_id, gear_name, distance, elapsed_time, moving_time, calories,
+                    average_heartrate, max_heartrate, average_watts, max_watts,
+                    average_speed, max_speed, type, sport_type, total_elevation_gain,
+                    kudos_count, weighted_average_watts, average_cadence, trainer,
+                    map_polyline, device_name, timezone, start_latlng, end_latlng,
+                    updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', tuple(activity_dict.values())[:-1])  # Exclude created_at
+                ''', (
+                    activity_dict['id'], activity_dict['athlete_name'], activity_dict['name'],
+                    activity_dict['start_date_local'], activity_dict['start_date'], activity_dict['utc_offset'],
+                    activity_dict['gear_id'], activity_dict['gear_name'], activity_dict['distance'],
+                    activity_dict['elapsed_time'], activity_dict['moving_time'], activity_dict['calories'],
+                    activity_dict['average_heartrate'], activity_dict['max_heartrate'], activity_dict['average_watts'],
+                    activity_dict['max_watts'], activity_dict['average_speed'], activity_dict['max_speed'],
+                    activity_dict['type'], activity_dict['sport_type'], activity_dict['total_elevation_gain'],
+                    activity_dict['kudos_count'], activity_dict['weighted_average_watts'], activity_dict['average_cadence'],
+                    activity_dict['trainer'], activity_dict['map_polyline'], activity_dict['device_name'],
+                    activity_dict['timezone'], activity_dict['start_latlng'], activity_dict['end_latlng']
+                ))
                 
                 if cursor.rowcount > 0:
                     new_count += 1
                     
             except sqlite3.Error as e:
                 logging.error(f"Error saving activity {activity.id}: {e}")
-        
+                        
         conn.commit()
         conn.close()
         
