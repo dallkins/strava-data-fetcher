@@ -28,27 +28,25 @@ import webbrowser
 # Configuration
 @dataclass
 class Config:
-    # Strava API
+    # Required fields first
     strava_client_id: str
     strava_client_secret: str
+    smtp_password: str
     
-    # Database
+    # Optional fields with defaults
     db_path: str = "strava_data.db"
     csv_path: str = "strava_rides.csv"
-    
-    # Email settings
-    smtp_email: str = "dominic.allkins@gmail.com"
-    smtp_password: str  # App password for Gmail
+    smtp_email: str = "dominic.allkins@gmail.com" 
     notification_email: str = "dominic@allkins.com"
-    
-    # API limits and testing
     test_mode: bool = False
-    max_test_activities: int = 3
+    max_test_activities: int = 5
     rate_limit_requests_per_15min: int = 100
     rate_limit_daily: int = 1000
-    
-    # Athletes
     athletes: Dict[str, Dict] = None
+    
+    def __post_init__(self):
+        if self.athletes is None:
+            self.athletes = {}
     
     @classmethod
     def from_env(cls):
@@ -56,21 +54,21 @@ class Config:
             strava_client_id=os.getenv("STRAVA_CLIENT_ID"),
             strava_client_secret=os.getenv("STRAVA_CLIENT_SECRET"),
             smtp_password=os.getenv("GMAIL_APP_PASSWORD"),
+            db_path=os.getenv("STRAVA_DB_PATH", "strava_data.db"),
+            csv_path=os.getenv("STRAVA_CSV_PATH", "strava_rides.csv"),
+            smtp_email=os.getenv("STRAVA_SMTP_EMAIL", "dominic.allkins@gmail.com"),
+            notification_email=os.getenv("STRAVA_NOTIFICATION_EMAIL", "dominic@allkins.com"),
             test_mode=os.getenv("TEST_MODE", "false").lower() == "true",
+            max_test_activities=int(os.getenv("STRAVA_MAX_TEST_ACTIVITIES", "3")),
             athletes={
                 "dominic": {
                     "access_token": os.getenv("DOMINIC_ACCESS_TOKEN"),
                     "refresh_token": os.getenv("DOMINIC_REFRESH_TOKEN"),
                     "expires_at": int(os.getenv("DOMINIC_TOKEN_EXPIRES", "0"))
-                }# commenting out clare for testing,
-#                "clare": {
-#                    "access_token": os.getenv("CLARE_ACCESS_TOKEN"),
-#                    "refresh_token": os.getenv("CLARE_REFRESH_TOKEN"),
-#                    "expires_at": int(os.getenv("CLARE_TOKEN_EXPIRES", "0"))
-#                }
+                }
             }
         )
-
+    
 @dataclass
 class StravaActivity:
     """Data class for Strava activity with all required fields"""
