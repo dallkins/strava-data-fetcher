@@ -39,7 +39,7 @@ class Config:
     smtp_email: str = "dominic.allkins@gmail.com" 
     notification_email: str = "dominic@allkins.com"
     test_mode: bool = False
-    max_test_activities: int = 5
+    max_test_activities: int = 3
     rate_limit_requests_per_15min: int = 100
     rate_limit_daily: int = 1000
     athletes: Dict[str, Dict] = None
