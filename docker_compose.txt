@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  strava-fetcher:
+    build: .
+    container_name: strava-fetcher
+    environment:
+      - STRAVA_CLIENT_ID=${STRAVA_CLIENT_ID}
+      - STRAVA_CLIENT_SECRET=${STRAVA_CLIENT_SECRET}
+      - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD}
+      - TEST_MODE=${TEST_MODE:-false}
+      - DOMINIC_ACCESS_TOKEN=${DOMINIC_ACCESS_TOKEN}
+      - DOMINIC_REFRESH_TOKEN=${DOMINIC_REFRESH_TOKEN}
+      - DOMINIC_TOKEN_EXPIRES=${DOMINIC_TOKEN_EXPIRES}
+      - CLARE_ACCESS_TOKEN=${CLARE_ACCESS_TOKEN}
+      - CLARE_REFRESH_TOKEN=${CLARE_REFRESH_TOKEN}
+      - CLARE_TOKEN_EXPIRES=${CLARE_TOKEN_EXPIRES}
+      - STRAVA_WEBHOOK_VERIFY_TOKEN=${STRAVA_WEBHOOK_VERIFY_TOKEN}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    command: python webhook_server.py
+    
+  # Cron job service for scheduled fetches
+  strava-scheduler:
+    build: .
+    container_name: strava-scheduler
+    environment:
+      - STRAVA_CLIENT_ID=${STRAVA_CLIENT_ID}
+      - STRAVA_CLIENT_SECRET=${STRAVA_CLIENT_SECRET}
+      - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD}
+      - TEST_MODE=${TEST_MODE:-false}
+      - DOMINIC_ACCESS_TOKEN=${DOMINIC_ACCESS_TOKEN}
+      - DOMINIC_REFRESH_TOKEN=${DOMINIC_REFRESH_TOKEN}
+      - DOMINIC_TOKEN_EXPIRES=${DOMINIC_TOKEN_EXPIRES}
+      - CLARE_ACCESS_TOKEN=${CLARE_ACCESS_TOKEN}
+      - CLARE_REFRESH_TOKEN=${CLARE_REFRESH_TOKEN}
+      - CLARE_TOKEN_EXPIRES=${CLARE_TOKEN_EXPIRES}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    command: python scheduler.py
+    depends_on:
+      - strava-fetcher
+
+volumes:
+  data:
+  logs:
