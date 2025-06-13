@@ -43,7 +43,7 @@ class Config:
     
     # API limits and testing
     test_mode: bool = False
-    max_test_activities: int = 5
+    max_test_activities: int = 3
     rate_limit_requests_per_15min: int = 100
     rate_limit_daily: int = 1000
     
@@ -62,12 +62,12 @@ class Config:
                     "access_token": os.getenv("DOMINIC_ACCESS_TOKEN"),
                     "refresh_token": os.getenv("DOMINIC_REFRESH_TOKEN"),
                     "expires_at": int(os.getenv("DOMINIC_TOKEN_EXPIRES", "0"))
-                },
-                "clare": {
-                    "access_token": os.getenv("CLARE_ACCESS_TOKEN"),
-                    "refresh_token": os.getenv("CLARE_REFRESH_TOKEN"),
-                    "expires_at": int(os.getenv("CLARE_TOKEN_EXPIRES", "0"))
-                }
+                }# commenting out clare for testing,
+#                "clare": {
+#                    "access_token": os.getenv("CLARE_ACCESS_TOKEN"),
+#                    "refresh_token": os.getenv("CLARE_REFRESH_TOKEN"),
+#                    "expires_at": int(os.getenv("CLARE_TOKEN_EXPIRES", "0"))
+#                }
             }
         )
 
