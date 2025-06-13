@@ -1,0 +1,5 @@
+.env
+*.log
+strava_data/
+__pycache__/
+*.pyc
