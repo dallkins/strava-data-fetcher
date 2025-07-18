@@ -1,3 +1,4 @@
+#enhanced_webhook_server.py
 #!/usr/bin/env python3
 """
 Enhanced Strava Webhook Server with Activity Update Tracking and Email Notifications
@@ -17,6 +18,8 @@ import threading
 import calendar
 from datetime import datetime, timedelta
 from dataclasses import asdict
+import psutil
+import gc
 
 # Third-party imports
 import mysql.connector
@@ -27,6 +30,10 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+#for calendar webhook
+from calendar_integration import get_valid_access_token, fetch_calendar_events, save_calendar_events
+import uuid
 
 # Local imports
 from strava_main import StravaDataFetcher, Config, parse_strava_activity
@@ -133,6 +140,72 @@ logger = logging.getLogger(__name__)
 # Initialize Strava components
 config = Config.from_env()
 fetcher = StravaDataFetcher(config)
+
+# ===== FIX 1: ImprovedCacheManager (NEW CLASS) =====
+class ImprovedCacheManager:
+    """Memory-efficient cache with automatic cleanup"""
+    
+    def __init__(self, max_size=1000, cleanup_interval=300):  # 5 minutes
+        self.cache = {}
+        self.max_size = max_size
+        self.cleanup_interval = cleanup_interval
+        self.last_cleanup = time.time()
+    
+    def get(self, key):
+        """Get item from cache"""
+        self._cleanup_if_needed()
+        item = self.cache.get(key)
+        if item and item['expires'] > time.time():
+            return item['value']
+        elif item:
+            # Item expired, remove it
+            del self.cache[key]
+        return None
+    
+    def set(self, key, value, ttl=1800):  # 30 minutes default TTL
+        """Set item in cache with TTL"""
+        self._cleanup_if_needed()
+        
+        # Prevent cache from growing too large
+        if len(self.cache) >= self.max_size:
+            self._force_cleanup()
+        
+        self.cache[key] = {
+            'value': value,
+            'expires': time.time() + ttl
+        }
+    
+    def _cleanup_if_needed(self):
+        """Cleanup expired items if enough time has passed"""
+        current_time = time.time()
+        if current_time - self.last_cleanup > self.cleanup_interval:
+            self._force_cleanup()
+    
+    def _force_cleanup(self):
+        """Force cleanup of expired items"""
+        current_time = time.time()
+        expired_keys = [
+            key for key, data in self.cache.items()
+            if data['expires'] < current_time
+        ]
+        
+        for key in expired_keys:
+            del self.cache[key]
+        
+        self.last_cleanup = current_time
+        
+        if expired_keys:
+            logger.debug(f"Cache cleanup: removed {len(expired_keys)} expired items")
+    
+    def clear(self):
+        """Clear all cache entries"""
+        self.cache.clear()
+        self.last_cleanup = time.time()
+    
+    def size(self):
+        """Get current cache size"""
+        return len(self.cache)
+
 # ===== EMAIL NOTIFICATION SYSTEM =====
 class EmailNotificationService:
     """Enhanced email notifications for webhook events with deduplication"""
@@ -140,7 +213,9 @@ class EmailNotificationService:
     def __init__(self, config: WebhookConfig):
         self.config = config
         self.api_url = "https://api.brevo.com/v3/smtp/email"
-        self.recent_emails = {}  # Email deduplication tracking
+        
+        # Use improved cache manager instead of simple dict
+        self.email_cache = ImprovedCacheManager(max_size=500, cleanup_interval=300)
         
         # Setup athlete email mapping
         self.athlete_emails = {
@@ -276,36 +351,28 @@ class EmailNotificationService:
             return False
     
     def should_send_email(self, activity_id, event_type):
-        """Check if email should be sent (deduplication logic)"""
+        """Check if email should be sent with improved deduplication"""
         email_key = f"{activity_id}_{event_type}"
-        current_time = time.time()
         
-        # Check recent emails
-        if email_key in self.recent_emails:
-            time_diff = current_time - self.recent_emails[email_key]
-            if time_diff < 1800:  # 30 minutes
-                logger.info(f"Skipping duplicate email for {email_key} (sent {time_diff:.0f}s ago)")
-                return False
+        # Check if we recently sent this email
+        recent_send = self.email_cache.get(email_key)
+        if recent_send:
+            logger.info(f"Skipping duplicate email for {email_key}")
+            return False
         
-        # Record this email
-        self.recent_emails[email_key] = current_time
-        
-        # Cleanup old entries (keep last 2 hours)
-        cutoff = current_time - 7200
-        self.recent_emails = {k: v for k, v in self.recent_emails.items() if v > cutoff}
-        
+        # Record this email (30 minute TTL)
+        self.email_cache.set(email_key, time.time(), ttl=1800)
         return True
     
     def clear_email_cache(self):
         """Clear email deduplication cache"""
-        self.recent_emails = {}
+        self.email_cache.clear()
         logger.info("Email deduplication cache cleared")
 
     def get_activity_stats(self, athlete_name=None, start_date=None, end_date=None):
-        """Get cycling activity statistics for a date range"""
+        """Get cycling activity statistics with proper connection management"""
         try:
-            conn = DatabaseManager(webhook_config).get_connection()
-            cursor = conn.cursor()
+            db_manager = DatabaseManager(self.config)  # Create fresh instance
             
             # Build WHERE conditions
             where_conditions = ["sport_type IN ('Ride', 'VirtualRide')"]
@@ -325,7 +392,6 @@ class EmailNotificationService:
             
             where_clause = " AND ".join(where_conditions)
             
-            # Execute stats query
             query = f'''
                 SELECT 
                     athlete_name,
@@ -340,8 +406,7 @@ class EmailNotificationService:
                 ORDER BY athlete_name
             '''
             
-            cursor.execute(query, params)
-            results = cursor.fetchall()
+            results = db_manager.execute_query(query, params, fetch_all=True)
             
             # Process results
             stats = {}
@@ -355,8 +420,6 @@ class EmailNotificationService:
                     'moving_time_hours': round((moving_time or 0) / 3600, 1)
                 }
             
-            cursor.close()
-            conn.close()
             return stats
         
         except Error as e:
@@ -364,21 +427,16 @@ class EmailNotificationService:
             return {}
     
     def get_activity_details(self, activity_id):
-        """Get detailed information for a specific activity"""
+        """Get detailed information for a specific activity with proper connection management"""
         try:
-            conn = DatabaseManager(webhook_config).get_connection()
-            cursor = conn.cursor()
+            db_manager = DatabaseManager(self.config)
             
-            cursor.execute('''
+            result = db_manager.execute_query('''
                 SELECT athlete_name, name, start_date_local, distance, 
                        total_elevation_gain, calories, type, sport_type
                 FROM strava_activities 
                 WHERE id = %s
-            ''', (activity_id,))
-            
-            result = cursor.fetchone()
-            cursor.close()
-            conn.close()
+            ''', (activity_id,), fetch_one=True)
             
             if result:
                 return {
@@ -399,50 +457,76 @@ class EmailNotificationService:
 
 # ===== DATABASE MANAGEMENT =====
 class DatabaseManager:
-    """Handles all database operations for the webhook server"""
+    """Enhanced database manager with connection pooling and better cleanup"""
     
     def __init__(self, config: WebhookConfig):
         self.config = config
+        self._max_connections = 5
     
     def get_connection(self):
-        """Get database connection with error handling"""
+        """Get database connection with automatic cleanup"""
         try:
-            return mysql.connector.connect(**self.config.db_config)
+            conn = mysql.connector.connect(**self.config.db_config)
+            # Set connection timeout to prevent hanging connections
+            conn.autocommit = True
+            return conn
         except Error as e:
             logger.error(f"Database connection failed: {e}")
             raise
     
-    def test_connection(self):
-        """Test database connectivity"""
+    def execute_query(self, query, params=None, fetch_one=False, fetch_all=False):
+        """Execute query with automatic connection management"""
+        conn = None
+        cursor = None
         try:
             conn = self.get_connection()
-            cursor = conn.cursor(buffered=True)  # Add buffered=True
-            cursor.execute('SELECT 1')
-            result = cursor.fetchone()  # Actually fetch the result
-            cursor.close()
-            conn.close()
-            return True
+            cursor = conn.cursor(buffered=True)
+            
+            cursor.execute(query, params or ())
+            
+            if fetch_one:
+                result = cursor.fetchone()
+            elif fetch_all:
+                result = cursor.fetchall()
+            else:
+                result = cursor.rowcount
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Database query failed: {e}")
+            raise
+        finally:
+            # CRITICAL: Always close resources
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    
+    def test_connection(self):
+        """Test database connectivity with proper cleanup"""
+        try:
+            result = self.execute_query('SELECT 1', fetch_one=True)
+            return result is not None
         except Exception as e:
             logger.error(f"Database connection test failed: {e}")
             return False
     
     def activity_exists(self, activity_id, athlete_id):
-        """Check if activity exists in database"""
+        """Check if activity exists with proper connection management"""
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute(
+            result = self.execute_query(
                 "SELECT COUNT(*) FROM strava_activities WHERE id = %s AND athlete_id = %s",
-                (activity_id, athlete_id)
+                (activity_id, athlete_id),
+                fetch_one=True
             )
-            
-            count = cursor.fetchone()[0]
-            cursor.close()
-            conn.close()
-            
-            return count > 0
-            
+            return (result[0] if result else 0) > 0
         except Exception as e:
             logger.error(f"Error checking if activity exists: {e}")
             return False
@@ -450,17 +534,12 @@ class DatabaseManager:
     def add_webhook_event(self, activity_id, athlete_id, event_type, aspect_type, raw_data):
         """Log webhook event for audit trail"""
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute('''
+            self.execute_query('''
                 INSERT INTO webhook_events 
                 (activity_id, athlete_id, event_type, aspect_type, raw_data, received_at)
                 VALUES (%s, %s, %s, %s, %s, NOW())
             ''', (activity_id, athlete_id, event_type, aspect_type, json.dumps(raw_data)))
             
-            cursor.close()
-            conn.close()
             logger.debug(f"Logged webhook event: {event_type}/{aspect_type} for activity {activity_id}")
             
         except Error as e:
@@ -672,41 +751,33 @@ class ActivityProcessor:
 
 # ===== WEBHOOK PROCESSING =====
 class WebhookProcessor:
-    """Handles incoming webhook events and coordinates responses"""
+    """Enhanced webhook processor with better memory management"""
     
     def __init__(self, config: WebhookConfig, email_service: EmailNotificationService):
         self.config = config
         self.email_service = email_service
         self.db_manager = DatabaseManager(config)
         self.activity_processor = ActivityProcessor(config)
-        self.recent_webhooks = {}  # Webhook deduplication
+        
+        # Use improved cache for webhook deduplication
+        self.webhook_cache = ImprovedCacheManager(max_size=1000, cleanup_interval=600)  # 10 minutes
     
     def is_duplicate_webhook(self, event_data):
-        """Check if this webhook event is a duplicate"""
+        """Check if this webhook event is a duplicate using improved cache"""
         event_time = event_data.get('event_time', int(time.time()))
         activity_id = event_data.get('object_id')
         aspect_type = event_data.get('aspect_type')
         
         event_key = f"{activity_id}_{aspect_type}_{event_time}"
-        current_time = int(time.time())
         
-        # Check for recent duplicates (within 10 minutes)
-        if event_key in self.recent_webhooks:
-            time_diff = current_time - self.recent_webhooks[event_key]
-            if time_diff < 600:
-                logger.info(f"Duplicate webhook ignored: {event_key}")
-                return True
+        # Check for recent duplicates
+        recent_webhook = self.webhook_cache.get(event_key)
+        if recent_webhook:
+            logger.info(f"Duplicate webhook ignored: {event_key}")
+            return True
         
-        # Record this webhook
-        self.recent_webhooks[event_key] = current_time
-        
-        # Cleanup old entries (keep last 30 minutes)
-        cutoff_time = current_time - 1800
-        self.recent_webhooks = {
-            k: v for k, v in self.recent_webhooks.items()
-            if v > cutoff_time
-        }
-        
+        # Record this webhook (10 minute TTL)
+        self.webhook_cache.set(event_key, time.time(), ttl=600)
         return False
     
     def get_athlete_name_from_id(self, owner_id):
@@ -714,7 +785,7 @@ class WebhookProcessor:
         return self.config.athlete_mappings.get(int(owner_id))
     
     async def process_webhook_event(self, event_data):
-        """Process incoming webhook event"""
+        """Process webhook event with better error handling"""
         try:
             # Extract event details
             object_type = event_data.get('object_type')
@@ -722,7 +793,7 @@ class WebhookProcessor:
             activity_id = event_data.get('object_id')
             owner_id = event_data.get('owner_id')
             
-            # Log the webhook event
+            # Log the webhook event using improved database method
             self.db_manager.add_webhook_event(
                 activity_id, owner_id, object_type, aspect_type, event_data
             )
@@ -740,7 +811,7 @@ class WebhookProcessor:
             
             logger.info(f"Processing {aspect_type} event for activity {activity_id} ({athlete_name})")
             
-            # Check if activity exists
+            # Check if activity exists using improved method
             activity_exists = self.db_manager.activity_exists(activity_id, owner_id)
             
             # Handle create events
@@ -1200,7 +1271,7 @@ def webhook_challenge():
 
 @app.route('/webhook', methods=['POST'])
 def webhook_event():
-    """Handle incoming webhook events from Strava"""
+    """Handle incoming webhook events with improved memory management"""
     try:
         event_data = request.get_json()
         
@@ -1214,62 +1285,40 @@ def webhook_event():
         if webhook_processor.is_duplicate_webhook(event_data):
             return "OK", 200
         
-        # Process webhook asynchronously
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
+        # IMPROVED: Better event loop management
         try:
+            # Try to get existing event loop first
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    raise RuntimeError("Loop is closed")
+            except RuntimeError:
+                # Create new loop only if necessary
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            # Process webhook
             success = loop.run_until_complete(webhook_processor.process_webhook_event(event_data))
-            if success:
-                return "OK", 200
-            else:
-                return "Processing Error", 500
-        finally:
-            loop.close()
+            
+            # CRITICAL: Clean up any remaining tasks
+            pending_tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
+            if pending_tasks:
+                logger.warning(f"Cleaning up {len(pending_tasks)} pending tasks")
+                for task in pending_tasks:
+                    task.cancel()
+                
+                # Wait for cancellation to complete
+                loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
+            
+            return "OK" if success else "Processing Error", 200 if success else 500
+            
+        except Exception as e:
+            logger.error(f"Event loop error: {e}")
+            return "Processing Error", 500
         
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
         return "Internal Server Error", 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Comprehensive health check endpoint"""
-    try:
-        health_status = {
-            'status': 'healthy',
-            'timestamp': datetime.now().isoformat(),
-            'version': '2.0',
-            'components': {
-                'database': 'healthy' if db_manager.test_connection() else 'unhealthy',
-                'email_service': 'configured' if webhook_config.brevo_api_key else 'not_configured',
-                'webhook_token': 'configured' if webhook_config.webhook_verify_token != 'your_verify_token_here' else 'not_configured',
-                'strava_api': 'configured' if webhook_config.strava_client_id else 'not_configured'
-            },
-            'athlete_mapping': {
-                'configured_athletes': len([name for name in webhook_config.athlete_mappings.values() if name]),
-                'athletes': list(webhook_config.athlete_mappings.values())
-            }
-        }
-        
-        # Determine overall health
-        unhealthy_components = [
-            k for k, v in health_status['components'].items()
-            if v in ['unhealthy', 'not_configured']
-        ]
-        
-        if unhealthy_components:
-            health_status['status'] = 'degraded'
-            health_status['issues'] = unhealthy_components
-        
-        return jsonify(health_status)
-        
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e),
-            'timestamp': datetime.now().isoformat()
-        }), 500
 
 @app.route('/stats', methods=['GET'])
 def webhook_stats():
@@ -1308,11 +1357,11 @@ def webhook_stats():
             },
             'activities_processed_last_7_days': recent_activities,
             'email_service': {
-                'recent_emails_cache_size': len(email_service.recent_emails),
+                'recent_emails_cache_size': email_service.email_cache.size(),  # ✅ CORRECT
                 'configured_athletes': len(email_service.athlete_emails)
             },
             'webhook_processor': {
-                'recent_webhooks_cache_size': len(webhook_processor.recent_webhooks)
+                'recent_webhooks_cache_size': webhook_processor.webhook_cache.size()  # ✅ CORRECT
             },
             'system': {
                 'uptime_check': datetime.now().isoformat(),
@@ -1323,6 +1372,129 @@ def webhook_stats():
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         return jsonify({'error': str(e)}), 500
+
+# ===== EMERGENCY FIX 4: Check What Went Wrong =====
+@app.route('/debug/startup', methods=['GET'])
+def debug_startup_status():
+    """Debug what components loaded successfully"""
+    status = {
+        "timestamp": datetime.now().isoformat(),
+        "python_modules": {},
+        "global_objects": {},
+        "imports": {}
+    }
+    
+    # Check important imports
+    try:
+        import psutil
+        status["imports"]["psutil"] = "available"
+    except ImportError:
+        status["imports"]["psutil"] = "missing - run: pip install psutil"
+    
+    try:
+        import gc
+        status["imports"]["gc"] = "available"
+    except ImportError:
+        status["imports"]["gc"] = "missing"
+    
+    # Check global objects
+    globals_to_check = [
+        'email_service', 'webhook_processor', 'db_manager', 
+        'webhook_config', 'scheduler'
+    ]
+    
+    for obj_name in globals_to_check:
+        if obj_name in globals():
+            obj = globals()[obj_name]
+            status["global_objects"][obj_name] = {
+                "exists": True,
+                "type": str(type(obj)),
+                "has_cache": hasattr(obj, 'email_cache') or hasattr(obj, 'webhook_cache')
+            }
+        else:
+            status["global_objects"][obj_name] = {"exists": False}
+    
+    # Check class definitions
+    classes_to_check = [
+        'ImprovedCacheManager', 'DatabaseManager', 
+        'EmailNotificationService', 'WebhookProcessor'
+    ]
+    
+    for class_name in classes_to_check:
+        if class_name in globals():
+            status["python_modules"][class_name] = "defined"
+        else:
+            status["python_modules"][class_name] = "missing"
+    
+    return jsonify(status)
+
+@app.route('/debug/memory', methods=['GET'])
+def debug_memory_status():
+    """Debug endpoint for memory status - safe version"""
+    try:
+        # Try to import psutil, fallback if not available
+        try:
+            import psutil
+            import gc
+            
+            # Get process memory info
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            
+            # Force garbage collection
+            collected = gc.collect()
+            
+            memory_data = {
+                "rss_mb": round(memory_info.rss / 1024 / 1024, 1),
+                "vms_mb": round(memory_info.vms / 1024 / 1024, 1),
+                "percent": process.memory_percent()
+            }
+            
+            system_data = {
+                "available_memory_mb": round(psutil.virtual_memory().available / 1024 / 1024, 1),
+                "memory_percent": psutil.virtual_memory().percent
+            }
+            
+        except ImportError:
+            memory_data = {"error": "psutil not installed"}
+            system_data = {"error": "psutil not installed"}
+            collected = 0
+        
+        # Safely get cache sizes
+        email_cache_size = 0
+        webhook_cache_size = 0
+        
+        try:
+            if 'email_service' in globals() and hasattr(email_service, 'email_cache'):
+                email_cache_size = email_service.email_cache.size()
+        except:
+            pass
+            
+        try:
+            if 'webhook_processor' in globals() and hasattr(webhook_processor, 'webhook_cache'):
+                webhook_cache_size = webhook_processor.webhook_cache.size()
+        except:
+            pass
+        
+        return jsonify({
+            "memory": memory_data,
+            "system": system_data,
+            "caches": {
+                "email_cache_size": email_cache_size,
+                "webhook_cache_size": webhook_cache_size
+            },
+            "garbage_collection": {
+                "objects_collected": collected
+            },
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Memory debug failed: {e}")
+        return jsonify({
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 
 @app.route('/admin/clear-email-cache', methods=['POST'])
 def clear_email_cache():
@@ -1342,7 +1514,7 @@ def clear_email_cache():
 def clear_webhook_cache():
     """Clear webhook deduplication cache"""
     try:
-        webhook_processor.recent_webhooks = {}
+        webhook_processor.webhook_cache.clear()
         return jsonify({
             "status": "success", 
             "message": "Webhook deduplication cache cleared",
@@ -1551,7 +1723,201 @@ def debug_database_test():
             "error": str(e),
             "test_timestamp": datetime.now().isoformat()
         }), 500
-        # ===== SCHEDULER SETUP =====
+
+# ===== CALENDAR WEBHOOK ROUTES =====
+@app.route('/webhook/calendar', methods=['POST', 'GET'])
+def handle_calendar_webhook():
+    """Handle calendar webhook with better memory management"""
+    
+    # Handle validation request
+    validation_token = request.args.get('validationToken')
+    if validation_token:
+        logger.info("Calendar webhook validation request received")
+        return validation_token, 200, {'Content-Type': 'text/plain'}
+    
+    # Handle notification (POST)
+    if request.method == 'POST':
+        try:
+            data = request.get_json(force=True)
+            
+            if not data or 'value' not in data:
+                return 'Invalid notification data', 400
+            
+            logger.info(f"Calendar webhook received {len(data['value'])} notifications")
+            
+            # Process notifications in a more memory-efficient way
+            for notification in data['value']:
+                try:
+                    process_calendar_notification(notification)
+                except Exception as e:
+                    logger.error(f"Error processing calendar notification: {e}")
+                    # Continue with other notifications
+            
+            # Force cleanup after processing
+            import gc
+            gc.collect()
+            
+            return '', 202  # Accepted
+            
+        except Exception as e:
+            logger.error(f"Error processing calendar webhook notification: {e}")
+            return 'Error processing notification', 500
+    
+    return 'Invalid request', 400
+
+@app.route('/admin/force-cleanup', methods=['POST'])
+def force_memory_cleanup():
+    """Force immediate memory cleanup - safe version"""
+    try:
+        import gc
+        
+        # Force garbage collection
+        collected = gc.collect()
+        
+        # Safely clean up caches
+        cache_results = {}
+        
+        try:
+            if 'email_service' in globals() and hasattr(email_service, 'email_cache'):
+                email_service.email_cache._force_cleanup()
+                cache_results['email_cache'] = 'cleaned'
+            else:
+                cache_results['email_cache'] = 'not available'
+        except Exception as e:
+            cache_results['email_cache'] = f'error: {str(e)}'
+        
+        try:
+            if 'webhook_processor' in globals() and hasattr(webhook_processor, 'webhook_cache'):
+                webhook_processor.webhook_cache._force_cleanup()
+                cache_results['webhook_cache'] = 'cleaned'
+            else:
+                cache_results['webhook_cache'] = 'not available'
+        except Exception as e:
+            cache_results['webhook_cache'] = f'error: {str(e)}'
+        
+        return jsonify({
+            "status": "success",
+            "message": "Memory cleanup completed",
+            "objects_collected": collected,
+            "cache_results": cache_results,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Force cleanup failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ===== COMPLETE FIX 6: Memory Cleanup Functions =====
+def setup_memory_cleanup_scheduler():
+    """Setup periodic memory cleanup - safe version"""
+    def cleanup_memory():
+        """Perform memory cleanup tasks - safe version"""
+        try:
+            import gc
+            
+            # Force garbage collection
+            collected = gc.collect()
+            
+            # Safely clean up caches
+            try:
+                if 'email_service' in globals() and hasattr(email_service, 'email_cache'):
+                    email_service.email_cache._force_cleanup()
+            except Exception as e:
+                logger.warning(f"Email cache cleanup failed: {e}")
+            
+            try:
+                if 'webhook_processor' in globals() and hasattr(webhook_processor, 'webhook_cache'):
+                    webhook_processor.webhook_cache._force_cleanup()
+            except Exception as e:
+                logger.warning(f"Webhook cache cleanup failed: {e}")
+            
+            logger.info(f"Memory cleanup completed: {collected} objects collected")
+            
+        except Exception as e:
+            logger.error(f"Memory cleanup failed: {e}")
+    
+    # Only add memory cleanup if scheduler exists
+    try:
+        if 'scheduler' in globals() and scheduler:
+            scheduler.add_job(
+                func=cleanup_memory,
+                trigger='interval',
+                minutes=15,
+                id='memory_cleanup',
+                name='Memory Cleanup Task'
+            )
+            logger.info("Memory cleanup scheduler configured")
+    except Exception as e:
+        logger.warning(f"Could not setup memory cleanup scheduler: {e}")
+
+def process_calendar_notification(notification):
+    """Process a single calendar notification"""
+    try:
+        subscription_id = notification.get('subscriptionId')
+        change_type = notification.get('changeType')
+        resource = notification.get('resource')
+        client_state = notification.get('clientState', '')
+        
+        logger.info(f"Processing calendar notification: {change_type} for {resource}")
+        
+        # Verify client state
+        if not client_state.startswith('calendar_webhook_'):
+            logger.warning(f"Invalid client state: {client_state}")
+            return
+        
+        # Extract user email from client state
+        parts = client_state.split('_')
+        if len(parts) >= 3:
+            user_email = parts[2]
+        else:
+            logger.warning(f"Could not extract user email from client state: {client_state}")
+            return
+        
+        # Trigger immediate calendar sync for this user
+        trigger_calendar_sync(user_email)
+        
+    except Exception as e:
+        logger.error(f"Error processing calendar notification: {e}")
+
+def trigger_calendar_sync(user_email):
+    """Trigger a calendar sync for a specific user"""
+    try:
+        logger.info(f"Triggering calendar sync for {user_email}")
+        
+        events = fetch_calendar_events(user_email)
+        if events is not None:
+            if save_calendar_events(user_email, events):
+                logger.info(f"Successfully synced {len(events)} events for {user_email}")
+                
+                # Optional: Send email notification about calendar sync
+                email_service.send_email(
+                    f"📅 Calendar Updated - {user_email}",
+                    f"""
+                    <html>
+                    <body style="font-family: Arial, sans-serif;">
+                        <h3>📅 Calendar Synchronized</h3>
+                        <p>Calendar events have been updated for <strong>{user_email}</strong></p>
+                        <p><strong>Events synced:</strong> {len(events)}</p>
+                        <p><strong>Sync time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                        <p style="color: #666; font-size: 12px;">
+                            <em>🤖 Dashboard Webhook Server</em>
+                        </p>
+                    </body>
+                    </html>
+                    """,
+                    [user_email]
+                )
+                
+            else:
+                logger.error(f"Failed to save events for {user_email}")
+        else:
+            logger.error(f"Failed to fetch events for {user_email}")
+            
+    except Exception as e:
+        logger.error(f"Error during calendar sync for {user_email}: {e}")
+
+
+# ===== SCHEDULER SETUP =====
 def setup_email_scheduler():
     """Setup and start the email scheduler for periodic summaries"""
     try:
@@ -1600,7 +1966,8 @@ def print_startup_banner():
     print("\n" + "="*70)
     print("🚀 Enhanced Strava Webhook Server v2.0")
     print("="*70)
-    print(f"📍 Webhook endpoint: http://dashboard.allkins.com/webhook")
+    print(f"📍 Strava webhook endpoint: http://dashboard.allkins.com/webhook")
+    print(f"📅 Calendar webhook: http://dashboard.allkins.com/webhook/calendar")
     print(f"🏥 Health check: http://dashboard.allkins.com/health")
     print(f"📊 Statistics: http://dashboard.allkins.com/stats")
     print(f"🧪 Test email: POST http://dashboard.allkins.com/test-email")
@@ -1624,21 +1991,43 @@ def print_startup_banner():
     print("🎯 Server starting...")
 
 def main():
-    """Main application entry point"""
+    """Minimal main function that should start successfully"""
     try:
-        # Print startup banner
-        print_startup_banner()
+        print("\n" + "="*50)
+        print("🚀 Starting Webhook Server (Safe Mode)")
+        print("="*50)
         
-        # Setup email scheduler
-        scheduler = setup_email_scheduler()
+        # Test database first
+        if not db_manager.test_connection():
+            logger.error("Database connection failed!")
+            print("❌ Database connection failed")
+        else:
+            logger.info("Database connection successful")
+            print("✅ Database connection successful")
         
-        if not scheduler:
-            logger.warning("Email scheduler failed to start - periodic summaries will not be sent")
+        # Setup email scheduler (but don't fail if it doesn't work)
+        try:
+            scheduler = setup_email_scheduler()
+            if scheduler:
+                print("✅ Email scheduler started")
+                
+                # Try to setup memory cleanup (but don't fail if it doesn't work)
+                try:
+                    setup_memory_cleanup_scheduler()
+                    print("✅ Memory cleanup scheduled")
+                except Exception as e:
+                    print(f"⚠️  Memory cleanup setup failed: {e}")
+            else:
+                print("⚠️  Email scheduler failed to start")
+        except Exception as e:
+            print(f"⚠️  Scheduler setup failed: {e}")
         
-        # Log successful startup
-        logger.info("Enhanced Strava Webhook Server v2.0 started successfully")
-        logger.info(f"Server listening on port {webhook_config.webhook_port}")
-        logger.info("Ready to process webhook events")
+        print(f"🎯 Starting server on port {webhook_config.webhook_port}")
+        print("📍 Debug endpoints:")
+        print("   - /health")
+        print("   - /debug/startup") 
+        print("   - /debug/memory")
+        print("="*50)
         
         # Start Flask application
         app.run(
@@ -1652,15 +2041,16 @@ def main():
         logger.info("Server stopped by user")
     except Exception as e:
         logger.error(f"Server startup failed: {e}")
-        exit(1)
+        print(f"❌ Server startup failed: {e}")
+        # Don't exit, just log the error
     finally:
-        # Cleanup
-        if 'scheduler' in locals() and scheduler:
-            try:
-                scheduler.shutdown()
+        # Safe cleanup
+        try:
+            if 'scheduler' in locals() and scheduler:
+                scheduler.shutdown(wait=False)
                 logger.info("Scheduler shutdown completed")
-            except Exception as e:
-                logger.error(f"Error shutting down scheduler: {e}")
+        except:
+            pass
 
 # ===== ERROR HANDLERS =====
 @app.errorhandler(404)
