@@ -102,12 +102,25 @@ class TestStravaAPIClient:
         """Test successful API request"""
         client = StravaAPIClient(self.athlete_config)
         
-        mock_response = AsyncMock()
+        # Mock response
+        mock_response = Mock()
         mock_response.status = 200
-        mock_response.json.return_value = {"id": 12345, "name": "Test Activity"}
+        mock_response.json = AsyncMock(return_value={"id": 12345, "name": "Test Activity"})
+        mock_response.raise_for_status = Mock()
         
-        mock_session = AsyncMock()
-        mock_session.get.return_value.__aenter__.return_value = mock_response
+        # Mock session with proper get method
+        mock_session = Mock()
+        
+        # Create async context manager for session.get
+        async def mock_get_context_manager(*args, **kwargs):
+            class MockContext:
+                async def __aenter__(self):
+                    return mock_response
+                async def __aexit__(self, exc_type, exc_val, exc_tb):
+                    return None
+            return MockContext()
+        
+        mock_session.get = mock_get_context_manager
         client.session = mock_session
         
         with patch.object(client, '_check_rate_limit', new_callable=AsyncMock):
@@ -125,12 +138,25 @@ class TestStravaAPIClient:
         """Test API request with parameters"""
         client = StravaAPIClient(self.athlete_config)
         
-        mock_response = AsyncMock()
+        # Mock response
+        mock_response = Mock()
         mock_response.status = 200
-        mock_response.json.return_value = []
+        mock_response.json = AsyncMock(return_value=[])
+        mock_response.raise_for_status = Mock()
         
-        mock_session = AsyncMock()
-        mock_session.get.return_value.__aenter__.return_value = mock_response
+        # Mock session with proper get method
+        mock_session = Mock()
+        
+        # Create async context manager for session.get
+        async def mock_get_context_manager(*args, **kwargs):
+            class MockContext:
+                async def __aenter__(self):
+                    return mock_response
+                async def __aexit__(self, exc_type, exc_val, exc_tb):
+                    return None
+            return MockContext()
+        
+        mock_session.get = mock_get_context_manager
         client.session = mock_session
         
         params = {"per_page": 50, "page": 1}
@@ -150,12 +176,25 @@ class TestStravaAPIClient:
         """Test POST API request"""
         client = StravaAPIClient(self.athlete_config)
         
-        mock_response = AsyncMock()
+        # Mock response
+        mock_response = Mock()
         mock_response.status = 201
-        mock_response.json.return_value = {"success": True}
+        mock_response.json = AsyncMock(return_value={"success": True})
+        mock_response.raise_for_status = Mock()
         
-        mock_session = AsyncMock()
-        mock_session.post.return_value.__aenter__.return_value = mock_response
+        # Mock session with proper post method
+        mock_session = Mock()
+        
+        # Create async context manager for session.post
+        async def mock_post_context_manager(*args, **kwargs):
+            class MockContext:
+                async def __aenter__(self):
+                    return mock_response
+                async def __aexit__(self, exc_type, exc_val, exc_tb):
+                    return None
+            return MockContext()
+        
+        mock_session.post = mock_post_context_manager
         client.session = mock_session
         
         data = {"name": "Updated Activity"}
@@ -195,14 +234,26 @@ class TestStravaAPIClient:
         """Test API request with rate limit error"""
         client = StravaAPIClient(self.athlete_config)
         
-        mock_response = AsyncMock()
+        # Mock response that will trigger rate limit handling
+        mock_response = Mock()
         mock_response.status = 429
-        mock_response.raise_for_status.side_effect = ClientResponseError(
+        mock_response.raise_for_status = Mock(side_effect=ClientResponseError(
             request_info=Mock(), history=(), status=429
-        )
+        ))
         
-        mock_session = AsyncMock()
-        mock_session.get.return_value.__aenter__.return_value = mock_response
+        # Mock session with proper get method
+        mock_session = Mock()
+        
+        # Create async context manager for session.get
+        async def mock_get_context_manager(*args, **kwargs):
+            class MockContext:
+                async def __aenter__(self):
+                    return mock_response
+                async def __aexit__(self, exc_type, exc_val, exc_tb):
+                    return None
+            return MockContext()
+        
+        mock_session.get = mock_get_context_manager
         client.session = mock_session
         
         with patch.object(client, '_check_rate_limit', new_callable=AsyncMock):
@@ -363,26 +414,28 @@ class TestStravaAPIClient:
         client = StravaAPIClient(self.athlete_config)
         
         # Mock multiple pages of results
-        page1_data = [{"id": i, "name": f"Activity {i}", "type": "Ride", "sport_type": "Ride", 
-                      "start_date_local": "2024-01-01T08:00:00Z", "start_date": "2024-01-01T08:00:00Z"} 
+        page1_data = [{"id": i, "name": f"Activity {i}", "type": "Ride", "sport_type": "Ride",
+                      "start_date_local": "2024-01-01T08:00:00Z", "start_date": "2024-01-01T08:00:00Z"}
                      for i in range(1, 51)]  # 50 activities
         page2_data = [{"id": i, "name": f"Activity {i}", "type": "Ride", "sport_type": "Ride",
-                      "start_date_local": "2024-01-01T08:00:00Z", "start_date": "2024-01-01T08:00:00Z"} 
+                      "start_date_local": "2024-01-01T08:00:00Z", "start_date": "2024-01-01T08:00:00Z"}
                      for i in range(51, 76)]  # 25 activities
         
         with patch.object(client, 'get_activities', new_callable=AsyncMock) as mock_get:
-            mock_get.side_effect = [page1_data, page2_data, []]  # Third call returns empty
+            mock_get.side_effect = [page1_data, page2_data]  # Only two calls needed for 75 activities
             
             activities = await client.fetch_and_parse_activities(limit=100)
         
         assert len(activities) == 75  # Total activities fetched
-        assert mock_get.call_count == 3  # Should make 3 API calls
+        assert mock_get.call_count == 2  # Should make 2 API calls
         
         # Verify pagination parameters
         calls = mock_get.call_args_list
-        assert calls[0][1] == {"per_page": 50, "page": 1}
-        assert calls[1][1] == {"per_page": 50, "page": 2}
-        assert calls[2][1] == {"per_page": 50, "page": 3}
+        # The actual implementation includes after/before parameters
+        assert calls[0][1]["per_page"] == 50
+        assert calls[0][1]["page"] == 1
+        assert calls[1][1]["per_page"] == 50
+        assert calls[1][1]["page"] == 2
     
     @pytest.mark.asyncio
     async def test_fetch_and_parse_activities_limit_reached(self):

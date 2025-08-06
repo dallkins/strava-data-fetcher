@@ -1,6 +1,15 @@
+# Core dependencies for Strava Data Fetcher
 aiohttp==3.9.0
 python-dotenv==1.0.0
 requests==2.31.0
-schedule==1.2.0
 flask==2.3.3
 mysql-connector-python==8.0.33
+
+# Scheduling for webhook server
+APScheduler==3.10.4
+
+# CLI interface
+click==8.1.7
+
+# Data validation and parsing
+dataclasses-json==0.6.1

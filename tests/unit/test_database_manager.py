@@ -150,9 +150,15 @@ class TestDatabaseManager:
         
         assert result is False
     
-    @patch.object(DatabaseManager, 'execute_query')
-    def test_save_activities_single(self, mock_execute_query):
+    @patch.object(DatabaseManager, 'get_cursor')
+    def test_save_activities_single(self, mock_get_cursor):
         """Test saving a single activity"""
+        # Mock the cursor context manager
+        mock_cursor = Mock()
+        mock_cursor.execute.return_value = None
+        mock_cursor.rowcount = 1
+        mock_get_cursor.return_value.__enter__.return_value = mock_cursor
+        mock_get_cursor.return_value.__exit__.return_value = None
         activity = StravaActivity(
             id=12345,
             athlete_id=67890,
@@ -187,21 +193,25 @@ class TestDatabaseManager:
             end_latlng=[51.5074, -0.1278]
         )
         
-        mock_execute_query.return_value = 1
-        
         result = self.db_manager.save_activities([activity])
         
         assert result == 1
-        mock_execute_query.assert_called_once()
+        mock_get_cursor.assert_called_once()
         
         # Verify the SQL query structure
-        call_args = mock_execute_query.call_args
+        call_args = mock_cursor.execute.call_args
         assert "INSERT INTO strava_activities" in call_args[0][0]
         assert "ON DUPLICATE KEY UPDATE" in call_args[0][0]
     
-    @patch.object(DatabaseManager, 'execute_query')
-    def test_save_activities_multiple(self, mock_execute_query):
+    @patch.object(DatabaseManager, 'get_cursor')
+    def test_save_activities_multiple(self, mock_get_cursor):
         """Test saving multiple activities"""
+        # Mock the cursor context manager
+        mock_cursor = Mock()
+        mock_cursor.execute.return_value = None
+        mock_cursor.rowcount = 1  # Each execute returns 1 row affected
+        mock_get_cursor.return_value.__enter__.return_value = mock_cursor
+        mock_get_cursor.return_value.__exit__.return_value = None
         activities = [
             StravaActivity(
                 id=12345,
@@ -271,20 +281,18 @@ class TestDatabaseManager:
             )
         ]
         
-        mock_execute_query.return_value = 2
-        
         result = self.db_manager.save_activities(activities)
         
         assert result == 2
-        mock_execute_query.assert_called_once()
+        mock_get_cursor.assert_called_once()
     
-    @patch.object(DatabaseManager, 'execute_query')
-    def test_save_activities_empty_list(self, mock_execute_query):
+    @patch.object(DatabaseManager, 'get_cursor')
+    def test_save_activities_empty_list(self, mock_get_cursor):
         """Test saving empty activities list"""
         result = self.db_manager.save_activities([])
         
         assert result == 0
-        mock_execute_query.assert_not_called()
+        mock_get_cursor.assert_not_called()
     
     @patch.object(DatabaseManager, 'execute_query')
     def test_get_activity_summary_all_athletes(self, mock_execute_query):
