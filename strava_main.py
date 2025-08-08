@@ -44,7 +44,7 @@ from urllib.parse import urlencode
 
 # Load environment variables
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 # ===== CONFIGURATION CLASSES =====
 
@@ -480,10 +480,10 @@ class DatabaseManager:
     def __init__(self, config: Config):
         self.config = config
         self.db_config = {
-            'host': os.getenv('DB_HOST', 'localhost'),
-            'user': os.getenv('DB_USER'),
-            'password': os.getenv('DB_PASSWORD'),
-            'database': os.getenv('DB_NAME'),
+            'host': config.get('DB_HOST', '127.0.0.1'),
+            'user': config.get('DB_USER'),
+            'password': config.get('DB_PASSWORD'),
+            'database': config.get('DB_NAME'),
             'charset': 'utf8mb4',
             'collation': 'utf8mb4_unicode_ci',
             'autocommit': True

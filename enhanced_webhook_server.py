@@ -39,7 +39,7 @@ import uuid
 from strava_main import StravaDataFetcher, Config, parse_strava_activity
 
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -55,7 +55,8 @@ class WebhookConfig:
         
         # Database configuration
         self.db_config = {
-            'host': os.getenv('DB_HOST', 'localhost'),
+            'host': os.getenv('DB_HOST', '127.0.0.1'),
+            'port': int(os.getenv('DB_PORT', '3306')),
             'user': os.getenv('DB_USER'),
             'password': os.getenv('DB_PASSWORD'),
             'database': os.getenv('DB_NAME'),
@@ -138,8 +139,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize Strava components
-config = Config.from_env()
-fetcher = StravaDataFetcher(config)
+#config = Config.from_env()
+#fetcher = StravaDataFetcher(config)
 
 # ===== FIX 1: ImprovedCacheManager (NEW CLASS) =====
 class ImprovedCacheManager:
@@ -466,7 +467,31 @@ class DatabaseManager:
     def get_connection(self):
         """Get database connection with automatic cleanup"""
         try:
-            conn = mysql.connector.connect(**self.config.db_config)
+            safe_cfg = {k: v for k, v in self.config.db_config.items() if k != 'password'}
+            logger.info(f"[DB DEBUG] Connecting with config: {safe_cfg}")
+            # Force TCP/IP and avoid unix socket resolution issues
+            conn = mysql.connector.connect(
+                host=self.config.db_config.get('host', '127.0.0.1'),
+                port=self.config.db_config.get('port', 3306),
+                user=self.config.db_config.get('user'),
+                password=self.config.db_config.get('password'),
+                database=self.config.db_config.get('database'),
+                charset=self.config.db_config.get('charset', 'utf8mb4'),
+                autocommit=self.config.db_config.get('autocommit', True),
+                use_pure=self.config.db_config.get('use_pure', True),
+                raise_on_warnings=self.config.db_config.get('raise_on_warnings', False),
+                unix_socket=None,
+                auth_plugin='mysql_native_password'
+            )
+            # Debug: Confirm server host seen by MySQL
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT SUBSTRING_INDEX(USER(), '@', -1)")
+                server_seen_host = cur.fetchone()[0]
+                cur.close()
+                logger.info(f"[DB DEBUG] MySQL sees client host as: {server_seen_host}")
+            except Exception as _e:
+                logger.info(f"[DB DEBUG] Could not read server-side client host: {_e}")
             # Set connection timeout to prevent hanging connections
             conn.autocommit = True
             return conn
@@ -512,6 +537,7 @@ class DatabaseManager:
     def test_connection(self):
         """Test database connectivity with proper cleanup"""
         try:
+            logger.info("[DB DEBUG] test_connection starting")
             result = self.execute_query('SELECT 1', fetch_one=True)
             return result is not None
         except Exception as e:
@@ -1240,16 +1266,22 @@ except ValueError as e:
     logger.error(f"Configuration validation failed: {e}")
     exit(1)
 
+# Debug log for DB host at init
+try:
+    _safe_cfg = {k: v for k, v in webhook_config.db_config.items() if k != 'password'}
+    logger.info(f"[DB DEBUG] WebhookConfig db_config at init: {_safe_cfg}")
+except Exception:
+    pass
+
 # Initialize services
 email_service = EmailNotificationService(webhook_config)
 webhook_processor = WebhookProcessor(webhook_config, email_service)
 summary_service = EmailSummaryService(email_service)
 db_manager = DatabaseManager(webhook_config)
 
-# Test database connection
+# Test database connection (do not hard-fail so /webhook can respond)
 if not db_manager.test_connection():
-    logger.error("Database connection test failed")
-    exit(1)
+    logger.error("Database connection test failed — continuing startup so webhook verify can succeed. Check [DB DEBUG] lines above for host/user.")
 
 logger.info("All services initialized successfully")
 # ===== FLASK ROUTES AND API ENDPOINTS =====
